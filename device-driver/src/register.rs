@@ -2,74 +2,150 @@ use bitvec::{array::BitArray, field::BitField};
 use core::{
     convert::{TryFrom, TryInto},
     marker::PhantomData,
-    ops::{Deref, DerefMut},
+    ops::{Add, Deref, DerefMut},
 };
 use funty::Integral;
 
 use crate::{ClearCapability, ReadCapability, WriteCapability};
 
+/// A trait for devices that have addressable registers.
+pub trait AddressableDevice {
+    /// The address type used by this interface. Should likely be an integer.
+    type AddressType;
+}
+
 /// A trait to represent the interface to the device.
 ///
 /// This is called to write to and read from registers.
-pub trait RegisterDevice {
+pub trait RegisterDevice: AddressableDevice {
     /// The error type
     type Error;
-    /// The address type used by this interface. Should likely be an integer.
-    type AddressType;
 
     /// Write the given data to the register.
     ///
     /// The address and the length of the register is descriped with the constant in the `R` [Register] type.
     /// The data can made into a normal slice by calling `as_raw_slice` on it.
-    fn write_register<R, const SIZE_BYTES: usize>(
+    fn write_register<const SIZE_BYTES: usize>(
         &mut self,
+        address: Self::AddressType,
         data: &BitArray<[u8; SIZE_BYTES]>,
-    ) -> Result<(), Self::Error>
-    where
-        R: Register<SIZE_BYTES, AddressType = Self::AddressType>;
+    ) -> Result<(), Self::Error>;
 
     /// Read the data from the register into the given buffer.
     ///
     /// The address and the length of the register is descriped with the constant in the `R` [Register] type.
     /// The data can made into a normal slice by calling `as_raw_slice` on it.
-    fn read_register<R, const SIZE_BYTES: usize>(
+    fn read_register<const SIZE_BYTES: usize>(
         &mut self,
+        address: Self::AddressType,
         data: &mut BitArray<[u8; SIZE_BYTES]>,
-    ) -> Result<(), Self::Error>
-    where
-        R: Register<SIZE_BYTES, AddressType = Self::AddressType>;
+    ) -> Result<(), Self::Error>;
 }
 
 /// A trait to represent the interface to the device.
 ///
 /// This is called to asynchronously write to and read from registers.
-pub trait AsyncRegisterDevice {
+pub trait AsyncRegisterDevice: AddressableDevice {
     /// The error type
     type Error;
-    /// The address type used by this interface. Should likely be an integer.
-    type AddressType;
 
     /// Write the given data to the register asynchronously.
     ///
     /// The address and the length of the register is descriped with the constant in the `R` [Register] type.
     /// The data can made into a normal slice by calling `as_raw_slice` on it.
-    async fn write_register<R, const SIZE_BYTES: usize>(
+    async fn write_register<const SIZE_BYTES: usize>(
         &mut self,
+        address: Self::AddressType,
         data: &BitArray<[u8; SIZE_BYTES]>,
-    ) -> Result<(), Self::Error>
-    where
-        R: Register<SIZE_BYTES, AddressType = Self::AddressType>;
+    ) -> Result<(), Self::Error>;
 
     /// Read the data from the register asynchronously into the given buffer.
     ///
     /// The address and the length of the register is descriped with the constant in the `R` [Register] type.
     /// The data can made into a normal slice by calling `as_raw_slice` on it.
-    async fn read_register<R, const SIZE_BYTES: usize>(
+    async fn read_register<const SIZE_BYTES: usize>(
         &mut self,
+        address: Self::AddressType,
         data: &mut BitArray<[u8; SIZE_BYTES]>,
-    ) -> Result<(), Self::Error>
-    where
-        R: Register<SIZE_BYTES, AddressType = Self::AddressType>;
+    ) -> Result<(), Self::Error>;
+}
+
+/// A trait to represent a block of registers.
+pub trait RegisterBlock {
+    /// The type of device this register block belongs to.
+    type Device: AddressableDevice;
+
+    /// The base address to use for registers in this register block.
+    ///
+    /// This base address will be added to the register's address when reading or writing the register to the parent device.
+    const BASE_ADDR: <Self::Device as AddressableDevice>::AddressType;
+
+    /// The device this register block belongs to.
+    fn dev(&mut self) -> &mut Self::Device;
+}
+
+impl<T: RegisterBlock> AddressableDevice for T {
+    type AddressType = <T::Device as AddressableDevice>::AddressType;
+}
+
+impl<T: RegisterBlock> RegisterDevice for T
+where
+    T::Device: RegisterDevice,
+    <T::Device as AddressableDevice>::AddressType: Add<
+        <T::Device as AddressableDevice>::AddressType,
+        Output = <T::Device as AddressableDevice>::AddressType,
+    >,
+{
+    type Error = <T::Device as RegisterDevice>::Error;
+
+    fn write_register<const SIZE_BYTES: usize>(
+        &mut self,
+        address: Self::AddressType,
+        data: &BitArray<[u8; SIZE_BYTES]>,
+    ) -> Result<(), Self::Error> {
+        self.dev()
+            .write_register::<SIZE_BYTES>(address + Self::BASE_ADDR, data)
+    }
+
+    fn read_register<const SIZE_BYTES: usize>(
+        &mut self,
+        address: Self::AddressType,
+        data: &mut BitArray<[u8; SIZE_BYTES]>,
+    ) -> Result<(), Self::Error> {
+        self.dev()
+            .read_register::<SIZE_BYTES>(address + Self::BASE_ADDR, data)
+    }
+}
+
+impl<T: RegisterBlock> AsyncRegisterDevice for T
+where
+    T::Device: AsyncRegisterDevice,
+    <T::Device as AddressableDevice>::AddressType: Add<
+        <T::Device as AddressableDevice>::AddressType,
+        Output = <T::Device as AddressableDevice>::AddressType,
+    >,
+{
+    type Error = <T::Device as AsyncRegisterDevice>::Error;
+
+    async fn write_register<const SIZE_BYTES: usize>(
+        &mut self,
+        address: Self::AddressType,
+        data: &BitArray<[u8; SIZE_BYTES]>,
+    ) -> Result<(), Self::Error> {
+        self.dev()
+            .write_register::<SIZE_BYTES>(address + Self::BASE_ADDR, data)
+            .await
+    }
+
+    async fn read_register<const SIZE_BYTES: usize>(
+        &mut self,
+        address: Self::AddressType,
+        data: &mut BitArray<[u8; SIZE_BYTES]>,
+    ) -> Result<(), Self::Error> {
+        self.dev()
+            .read_register::<SIZE_BYTES>(address + Self::BASE_ADDR, data)
+            .await
+    }
 }
 
 /// The abstraction and description of a register.
@@ -164,7 +240,8 @@ where
     ) -> Result<(), D::Error> {
         let mut register = R::reset_value().into();
         f(&mut register);
-        self.device.write_register::<R, SIZE_BYTES>(register.bits())
+        self.device
+            .write_register::<SIZE_BYTES>(R::ADDRESS, register.bits())
     }
 
     /// Write to the register.
@@ -176,7 +253,8 @@ where
     ) -> Result<(), D::Error> {
         let mut register = R::ZERO.into();
         f(&mut register);
-        self.device.write_register::<R, SIZE_BYTES>(register.bits())
+        self.device
+            .write_register::<SIZE_BYTES>(R::ADDRESS, register.bits())
     }
 }
 
@@ -190,7 +268,7 @@ where
     pub fn read(&mut self) -> Result<R::ReadFields, D::Error> {
         let mut register = R::ZERO;
         self.device
-            .read_register::<R, SIZE_BYTES>(register.bits_mut())?;
+            .read_register::<SIZE_BYTES>(R::ADDRESS, register.bits_mut())?;
         Ok(register.into())
     }
 }
@@ -212,7 +290,7 @@ where
         let mut register = self.read()?.into().into();
         f(&mut register);
         self.device
-            .write_register::<R, SIZE_BYTES>(register.into().bits())
+            .write_register::<SIZE_BYTES>(R::ADDRESS, register.into().bits())
     }
 }
 
@@ -225,7 +303,7 @@ where
     /// Write the reset value (or zero if the reset value is specified) to the register
     pub fn clear(&mut self) -> Result<(), D::Error> {
         self.device
-            .write_register::<R, SIZE_BYTES>(R::reset_value().bits())
+            .write_register::<SIZE_BYTES>(R::ADDRESS, R::reset_value().bits())
     }
 }
 
@@ -246,7 +324,7 @@ where
         let mut register = R::reset_value().into();
         f(&mut register);
         self.device
-            .write_register::<R, SIZE_BYTES>(register.bits())
+            .write_register::<SIZE_BYTES>(R::ADDRESS, register.bits())
             .await
     }
 
@@ -260,7 +338,7 @@ where
         let mut register = R::ZERO.into();
         f(&mut register);
         self.device
-            .write_register::<R, SIZE_BYTES>(register.bits())
+            .write_register::<SIZE_BYTES>(R::ADDRESS, register.bits())
             .await
     }
 }
@@ -275,7 +353,7 @@ where
     pub async fn read_async(&mut self) -> Result<R::ReadFields, D::Error> {
         let mut register = R::ZERO;
         self.device
-            .read_register::<R, SIZE_BYTES>(register.bits_mut())
+            .read_register::<SIZE_BYTES>(R::ADDRESS, register.bits_mut())
             .await?;
         Ok(register.into())
     }
@@ -298,7 +376,7 @@ where
         let mut register = self.read_async().await?.into().into();
         f(&mut register);
         self.device
-            .write_register::<R, SIZE_BYTES>(register.into().bits())
+            .write_register::<SIZE_BYTES>(R::ADDRESS, register.into().bits())
             .await
     }
 }
@@ -312,7 +390,7 @@ where
     /// Write the reset value (or zero if the reset value is specified) to the register
     pub async fn clear_async(&mut self) -> Result<(), D::Error> {
         self.device
-            .write_register::<R, SIZE_BYTES>(R::reset_value().bits())
+            .write_register::<SIZE_BYTES>(R::ADDRESS, R::reset_value().bits())
             .await
     }
 }
